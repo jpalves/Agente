@@ -1,0 +1,683 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+import sqlite3
+import ssl
+import subprocess
+from array import array
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import httpx
+import ollama
+from pypdf import PdfReader
+
+MODEL = "hf.co/duarteocarmo/AMALIA-9B-0626-DPO-GGUF:Q4_K_M"
+#MODEL = "gemma4:e4b"
+EMBEDDING_MODEL = "nomic-embed-text"
+DOCUMENTS_DIR = Path(__file__).with_name("documentos")
+CHUNK_SIZE = 1800
+CHUNK_OVERLAP = 240
+TOP_K = 8
+SIMILARIDADE_MINIMA = 0.2
+PESO_EMBEDDINGS = 0.4
+PESO_JACCARD = 0.6
+EXTENSOES_TEXTO = {
+    ".txt",
+    ".md",
+    ".py",
+    ".json",
+    ".cpp",
+    ".h",
+    ".hpp",
+    ".cc",
+    ".c"
+}
+EXTENSOES_PDF = {".pdf"}
+TAMANHO_LOTE_EMBED = 16
+FAVICON = Path(__file__).with_name("favicon.ico")
+CACHE_DB = Path(__file__).with_name("indice.db")
+TEMPO_LIMITE_OLLAMA = 120
+MOSTRAR_RACIOCINIO = False
+
+CERTIFICADO_DIR = Path(__file__).with_name("certificados")
+CERTIFICADO_CRT = CERTIFICADO_DIR / "servidor.crt"
+CERTIFICADO_KEY = CERTIFICADO_DIR / "servidor.key"
+SERVIDOR_HOST = "0.0.0.0"
+SERVIDOR_PORTA = 8443
+
+# Alguns modelos (como este) não suportam o parâmetro `think` do Ollama
+# e respondem com ResponseError 400. Assim que isso acontece uma vez,
+# desligamos automaticamente para as próximas chamadas.
+_raciocinio_suportado: bool | None = None
+_aviso_raciocinio_mostrado = False
+
+
+class TempoEsgotadoError(TimeoutError):
+    """Indica que o servidor Ollama não respondeu dentro do tempo previsto."""
+
+
+# O timeout do httpx é o que realmente interrompe a ligação ao servidor
+# Ollama; um alarme por sinal (SIGALRM) não funciona aqui porque o httpx
+# intercepta qualquer exceção lançada durante a leitura de rede e a
+# converte em httpx.ReadTimeout/httpx.ConnectError, escondendo a nossa.
+cliente = ollama.Client(timeout=TEMPO_LIMITE_OLLAMA)
+
+
+def executar_com_limite(funcao, *args, **kwargs):
+    """Chama o Ollama e converte erros de rede/timeout numa exceção comum."""
+    try:
+        return funcao(*args, **kwargs)
+    except (httpx.TimeoutException, httpx.ConnectError) as erro:
+        raise TempoEsgotadoError(
+            f"O Ollama não respondeu em {TEMPO_LIMITE_OLLAMA} segundos "
+            "(ou não está acessível)."
+        ) from erro
+
+@dataclass
+class Trecho:
+    texto: str
+    fonte: str
+    vetor: list[float]
+
+def dividir_em_trechos(texto: str) -> list[str]:
+    """Divide um documento em parágrafos/frases, agrupando-os até ao
+    tamanho alvo. Evita cortar a meio de palavras/frases, o que gerava
+    trechos sem sentido e muito repetidos entre si."""
+    paragrafos = [p.strip() for p in re.split(r"\n\s*\n", texto) if p.strip()]
+    unidades: list[str] = []
+    for paragrafo in paragrafos:
+        frases = re.split(r"(?<=[.!?])\s+", " ".join(paragrafo.split()))
+        for frase in frases:
+            if not frase:
+                continue
+            # salvaguarda: texto sem pontuação (ex.: código-fonte ou PDFs
+            # mal extraídos) pode gerar uma "frase" gigantesca que nunca
+            # é cortada abaixo; corta-a à força em blocos de CHUNK_SIZE
+            # para não enviar trechos enormes ao modelo de embeddings.
+            if len(frase) > CHUNK_SIZE * 2:
+                for inicio in range(0, len(frase), CHUNK_SIZE):
+                    unidades.append(frase[inicio : inicio + CHUNK_SIZE])
+            else:
+                unidades.append(frase)
+
+    if not unidades:
+        return []
+
+    trechos = []
+    atual = ""
+    for unidade in unidades:
+        candidato = f"{atual} {unidade}".strip() if atual else unidade
+        if len(candidato) > CHUNK_SIZE and atual:
+            trechos.append(atual)
+            # pequena sobreposição: repete o fim do trecho anterior
+            atual = f"{atual[-CHUNK_OVERLAP:]} {unidade}".strip()
+        else:
+            atual = candidato
+    if atual:
+        trechos.append(atual)
+
+    # remove trechos duplicados ou quase idênticos entre si
+    vistos: set[str] = set()
+    trechos_unicos = []
+    for trecho in trechos:
+        chave = trecho[:200]
+        if chave in vistos:
+            continue
+        vistos.add(chave)
+        trechos_unicos.append(trecho)
+    return trechos_unicos
+
+
+def similaridade(vetor_a: list[float], vetor_b: list[float]) -> float:
+    produto = sum(a * b for a, b in zip(vetor_a, vetor_b))
+    norma_a = math.sqrt(sum(a * a for a in vetor_a))
+    norma_b = math.sqrt(sum(b * b for b in vetor_b))
+    
+    return produto / (norma_a * norma_b) if norma_a and norma_b else 0.0
+
+
+def similaridade_jaccard(texto_a: str, texto_b: str) -> float:
+    """Compara a proporção de palavras partilhadas entre dois textos."""
+    palavras_a = set(re.findall(r"\w+", texto_a.casefold()))
+    palavras_b = set(re.findall(r"\w+", texto_b.casefold()))
+    uniao = palavras_a | palavras_b
+    return len(palavras_a & palavras_b) / len(uniao) if uniao else 0.0
+
+
+def pontuacao_relevancia(
+    pergunta: str, vetor_pergunta: list[float], trecho: Trecho
+) -> float:
+    score_embeddings = similaridade(vetor_pergunta, trecho.vetor)
+    score_jaccard = similaridade_jaccard(pergunta, trecho.texto)
+    return PESO_EMBEDDINGS * score_embeddings + PESO_JACCARD * score_jaccard
+
+
+def remover_surrogates_invalidos(texto: str) -> str:
+    """Remove caracteres substitutos (surrogates) isolados.
+
+    Alguns PDFs (sobretudo com símbolos matemáticos/fontes customizadas)
+    têm cmaps mal formados; o pypdf acaba por extrair metade de um par
+    surrogate (ex.: '\\ud835' sem o seu par), o que é válido em `str` mas
+    não pode ser codificado em UTF-8 — e isso rebentava o pedido JSON ao
+    Ollama. Como não há forma fiável de recuperar o caracter original,
+    descartamo-lo."""
+    return texto.encode("utf-8", errors="ignore").decode("utf-8")
+
+
+def ler_pdf(caminho: Path) -> str:
+    """Extrai o texto de um PDF, página a página."""
+    leitor = PdfReader(str(caminho))
+    paginas = []
+    for pagina in leitor.pages:
+        texto_pagina = pagina.extract_text() or ""
+        if texto_pagina.strip():
+            paginas.append(texto_pagina)
+    return remover_surrogates_invalidos("\n\n".join(paginas))
+
+
+def ler_documento(caminho: Path) -> str:
+    """Lê o conteúdo de um documento, tratando PDFs de forma diferente
+    de ficheiros de texto simples."""
+    if caminho.suffix.lower() in EXTENSOES_PDF:
+        return ler_pdf(caminho)
+    return remover_surrogates_invalidos(caminho.read_text(encoding="utf-8"))
+
+
+def _abrir_cache() -> sqlite3.Connection:
+    ligacao = sqlite3.connect(CACHE_DB)
+    ligacao.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS meta (chave TEXT PRIMARY KEY, valor TEXT);
+        CREATE TABLE IF NOT EXISTS ficheiros (
+            caminho TEXT PRIMARY KEY, mtime_ns INTEGER, tamanho INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS trechos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            caminho TEXT NOT NULL REFERENCES ficheiros(caminho) ON DELETE CASCADE,
+            texto TEXT NOT NULL,
+            vetor BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_trechos_caminho ON trechos(caminho);
+        """
+    )
+    ligacao.execute("PRAGMA foreign_keys = ON")
+    # Se o modelo ou o tamanho dos trechos mudou, os vetores guardados
+    # deixam de ser válidos e a cache é descartada.
+    assinatura = f"{EMBEDDING_MODEL}|{CHUNK_SIZE}|{CHUNK_OVERLAP}"
+    guardada = ligacao.execute(
+        "SELECT valor FROM meta WHERE chave = 'assinatura'"
+    ).fetchone()
+    if guardada is None or guardada[0] != assinatura:
+        ligacao.execute("DELETE FROM trechos")
+        ligacao.execute("DELETE FROM ficheiros")
+        ligacao.execute(
+            "INSERT OR REPLACE INTO meta VALUES ('assinatura', ?)", (assinatura,)
+        )
+        ligacao.commit()
+    return ligacao
+
+
+def _gerar_embeddings(textos: list[str]) -> list[list[float]] | None:
+    """Calcula embeddings em lotes pequenos (um pedido gigante pode
+    derrubar o servidor). Devolve None se algum lote falhar."""
+    vetores: list[list[float]] = []
+    for inicio in range(0, len(textos), TAMANHO_LOTE_EMBED):
+        lote = textos[inicio : inicio + TAMANHO_LOTE_EMBED]
+        try:
+            resposta = executar_com_limite(
+                cliente.embed, model=EMBEDDING_MODEL, input=lote
+            )
+        except (TempoEsgotadoError, ollama.ResponseError) as erro:
+            print(f"Aviso: falhou um lote de embeddings ({len(lote)} trechos): {erro}")
+            return None
+        vetores.extend(resposta["embeddings"])
+    return vetores
+
+
+def criar_indice() -> list[Trecho]:
+    """Devolve o índice da pasta de documentos, usando uma cache SQLite.
+
+    Só os ficheiros novos ou modificados (mtime/tamanho) são relidos e
+    voltam a passar pelo modelo de embeddings; os restantes são lidos
+    diretamente da base de dados."""
+    if not DOCUMENTS_DIR.exists():
+        DOCUMENTS_DIR.mkdir()
+        return []
+
+    extensoes_suportadas = EXTENSOES_TEXTO | EXTENSOES_PDF
+    ficheiros = {
+        str(f.relative_to(DOCUMENTS_DIR)): f
+        for f in DOCUMENTS_DIR.rglob("*")
+        if f.is_file() and f.suffix.lower() in extensoes_suportadas
+    }
+
+    ligacao = _abrir_cache()
+    try:
+        em_cache = {
+            caminho: (mtime, tamanho)
+            for caminho, mtime, tamanho in ligacao.execute(
+                "SELECT caminho, mtime_ns, tamanho FROM ficheiros"
+            )
+        }
+        for caminho in set(em_cache) - set(ficheiros):
+            ligacao.execute("DELETE FROM ficheiros WHERE caminho = ?", (caminho,))
+        ligacao.commit()
+
+        indice: list[Trecho] = []
+        novos = 0
+        for caminho, ficheiro in sorted(ficheiros.items()):
+            estado = ficheiro.stat()
+            assinatura = (estado.st_mtime_ns, estado.st_size)
+            if em_cache.get(caminho) == assinatura:
+                for texto, blob in ligacao.execute(
+                    "SELECT texto, vetor FROM trechos WHERE caminho = ?", (caminho,)
+                ):
+                    vetor = array("f")
+                    vetor.frombytes(blob)
+                    indice.append(Trecho(texto, caminho, vetor.tolist()))
+                continue
+
+            try:
+                conteudo = ler_documento(ficheiro)
+            except Exception as erro:
+                print(f"Aviso: não foi possível ler '{ficheiro.name}': {erro}")
+                continue
+            textos = dividir_em_trechos(conteudo)
+            vetores = _gerar_embeddings(textos) if textos else []
+            if vetores is None:
+                continue  # não fica em cache: será tentado de novo no próximo arranque
+
+            print(f"  indexado: {caminho} ({len(textos)} trechos)")
+            ligacao.execute("DELETE FROM ficheiros WHERE caminho = ?", (caminho,))
+            ligacao.execute(
+                "INSERT INTO ficheiros VALUES (?, ?, ?)", (caminho, *assinatura)
+            )
+            ligacao.executemany(
+                "INSERT INTO trechos (caminho, texto, vetor) VALUES (?, ?, ?)",
+                [
+                    (caminho, texto, array("f", vetor).tobytes())
+                    for texto, vetor in zip(textos, vetores)
+                ],
+            )
+            ligacao.commit()  # progresso guardado ficheiro a ficheiro
+            indice.extend(
+                Trecho(texto, caminho, vetor) for texto, vetor in zip(textos, vetores)
+            )
+            novos += 1
+        if novos:
+            print(f"{novos} ficheiro(s) novos/alterados indexados.")
+        return indice
+    finally:
+        ligacao.close()
+
+
+def recuperar(pergunta: str, indice: list[Trecho]) -> list[Trecho]:
+    if not indice:
+        return []
+    vetor_pergunta = executar_com_limite(
+        cliente.embed, model=EMBEDDING_MODEL, input=pergunta
+    )["embeddings"][0]
+    candidatos = sorted(
+        (
+            (pontuacao_relevancia(pergunta, vetor_pergunta, trecho), trecho)
+            for trecho in indice
+        ),
+        key=lambda candidato: candidato[0],
+        reverse=True,
+    )
+    # só considera trechos suficientemente relevantes, para não "encher"
+    # o contexto com resultados fracos que confundem o modelo
+    relevantes = [
+        trecho
+        for pontuacao, trecho in candidatos
+        if pontuacao >= SIMILARIDADE_MINIMA
+    ]
+    return relevantes[:TOP_K]
+
+
+INSTRUCAO_SISTEMA = (
+    "Responde diretamente ao utilizador, em português europeu. "
+    "Não descrevas o teu processo de raciocínio, não numeres passos de "
+    "análise, não expliques como chegaste à resposta e não incluas "
+    "rascunhos internos. Escreve apenas a resposta final, de forma "
+    "natural e concisa. Escreve fórmulas matemáticas em LaTeX, entre $...$ "
+    "(em linha) ou $$...$$ (em bloco)."
+)
+
+
+def limpar_raciocinio_do_texto(texto: str) -> str:
+    """Remove blocos de 'pensamento em voz alta' que alguns modelos
+    inserem no próprio `content`, em vez de os enviar em `thinking`.
+    Deteta o padrão típico "1. **Passo**: ..." seguido da resposta
+    final e mantém apenas essa última parte."""
+    marcadores_finais = [
+        "Final Output Generation",
+        "Resposta final",
+        "Output Generation",
+    ]
+    for marcador in marcadores_finais:
+        indice_marcador = texto.rfind(marcador)
+        if indice_marcador != -1:
+            resto = texto[indice_marcador + len(marcador):]
+            resto = resto.lstrip(":*.\n ")
+            if resto.strip():
+                return resto.strip()
+
+    # Se o texto começa por uma lista numerada em negrito ("1. **...**"),
+    # assume-se que é raciocínio; tenta encontrar a última linha "solta"
+    # não numerada e usa-a como resposta.
+    linhas = texto.splitlines()
+    if linhas and re.match(r"^\s*\d+\.\s*\*\*", linhas[0]):
+        for linha in reversed(linhas):
+            linha_limpa = linha.strip().strip("*")
+            if linha_limpa and not re.match(r"^\d+\.", linha_limpa):
+                return linha_limpa
+    return texto
+
+
+def responder(pergunta: str, indice: list[Trecho]) -> tuple[str, str | None]:
+    """Devolve (resposta, raciocínio). O raciocínio pode ser None se o
+    modelo não o suportar ou se `MOSTRAR_RACIOCINIO` estiver desligado."""
+    global _raciocinio_suportado
+
+    try:
+        contexto = recuperar(pergunta, indice)
+        if contexto:
+            fontes = "\n\n".join(
+                f"[Fonte: {trecho.fonte}]\n{trecho.texto}" for trecho in contexto
+            )
+            instrucao = (
+                "Usa apenas o contexto abaixo para responder. Não mistures "
+                "informação de fontes diferentes como se fosse uma só; se "
+                "houver informação em conflito entre fontes, aponta a "
+                "diferença em vez de escolher uma ao acaso. Se a resposta "
+                "não estiver claramente no contexto, diz que não encontraste "
+                "informação suficiente — não inventes nem completes com "
+                "conhecimento próprio. Indica sempre as fontes usadas no "
+                "fim.\n\n"
+                f"Contexto:\n{fontes}\n\nPergunta: {pergunta}"
+            )
+        else:
+            instrucao = (
+                "Não existem documentos na base de conhecimento "
+                f"({DOCUMENTS_DIR}). Responde apenas se souberes.\n\n"
+                f"Pergunta: {pergunta}"
+            )
+
+        pedir_raciocinio = MOSTRAR_RACIOCINIO and _raciocinio_suportado is not False
+        mensagens = [
+            {"role": "system", "content": INSTRUCAO_SISTEMA},
+            {"role": "user", "content": instrucao},
+        ]
+        try:
+            response = executar_com_limite(
+                cliente.chat,
+                model=MODEL,
+                messages=mensagens,
+                think=pedir_raciocinio,
+            )
+        except ollama.ResponseError as erro:
+            if pedir_raciocinio and erro.status_code == 400:
+                # o modelo não suporta "think"; desativa e tenta de novo
+                _raciocinio_suportado = False
+                response = executar_com_limite(
+                    cliente.chat,
+                    model=MODEL,
+                    messages=mensagens,
+                )
+            else:
+                raise
+
+        if pedir_raciocinio:
+            _raciocinio_suportado = True
+        raciocinio = response["message"].get("thinking") if pedir_raciocinio else None
+        conteudo = limpar_raciocinio_do_texto(response["message"]["content"])
+        return conteudo, raciocinio
+    except TempoEsgotadoError as erro:
+        return f"Tempo esgotado: {erro} Tenta novamente.", None
+
+
+
+def garantir_certificado() -> None:
+    """Gera um certificado autoassinado (via openssl) se ainda não existir.
+    Suficiente para desenvolvimento/uso na rede local; navegadores vão
+    mostrar um aviso de "certificado não confiável" por não ser emitido
+    por uma autoridade reconhecida."""
+    if CERTIFICADO_CRT.exists() and CERTIFICADO_KEY.exists():
+        return
+
+    CERTIFICADO_DIR.mkdir(exist_ok=True)
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", str(CERTIFICADO_KEY),
+            "-out", str(CERTIFICADO_CRT),
+            "-days", "365", "-nodes",
+            "-subj", "/CN=localhost",
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+PAGINA_CHAT = """<!DOCTYPE html>
+<html lang="pt-PT">
+<head>
+<meta charset="UTF-8">
+<title>Agente RAG</title>
+<link rel="icon" href="/favicon.ico" type="image/x-icon">
+<script>
+window.MathJax = {
+  tex: {
+    inlineMath: [['$', '$'], ['\\\\(', '\\\\)']],
+    displayMath: [['$$', '$$'], ['\\\\[', '\\\\]']],
+  },
+  options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] },
+};
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 700px; margin: 2rem auto; }
+  #historico { border: 1px solid #ccc; border-radius: 8px; padding: 1rem;
+               height: 400px; overflow-y: auto; margin-bottom: 1rem; }
+  .msg { margin-bottom: 0.75rem; white-space: pre-wrap; }
+  .tu { color: #0a5; }
+  .agente { color: #333; }
+  form { display: flex; gap: 0.5rem; }
+  input { flex: 1; padding: 0.5rem; }
+  button { padding: 0.5rem 1rem; }
+</style>
+</head>
+<body>
+  <h1>Base de conhecimento</h1>
+  <div id="historico"></div>
+  <form id="form">
+    <input id="pergunta" autocomplete="off" placeholder="Escreve a tua pergunta..." />
+    <button type="submit">Enviar</button>
+  </form>
+<script>
+const historico = document.getElementById('historico');
+const form = document.getElementById('form');
+const campo = document.getElementById('pergunta');
+
+function adicionar(classe, texto) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + classe;
+  div.textContent = texto;
+  historico.appendChild(div);
+  historico.scrollTop = historico.scrollHeight;
+}
+
+function renderizarMatematica(elemento) {
+  if (window.MathJax && MathJax.typesetPromise) {
+    MathJax.typesetPromise([elemento]).catch(() => {});
+  }
+}
+
+form.addEventListener('submit', async (evento) => {
+  evento.preventDefault();
+  const pergunta = campo.value.trim();
+  if (!pergunta) return;
+  adicionar('tu', 'Tu: ' + pergunta);
+  campo.value = '';
+  adicionar('agente', 'Agente: ...');
+  const ultimo = historico.lastElementChild;
+  try {
+    const resposta = await fetch('/api/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({pergunta}),
+    });
+    const dados = await resposta.json();
+    ultimo.textContent = 'Agente: ' + (dados.resposta || dados.erro || '(sem resposta)');
+    renderizarMatematica(ultimo);
+  } catch (erro) {
+    ultimo.textContent = 'Agente: erro de ligação ao servidor.';
+  }
+});
+</script>
+</body>
+</html>
+"""
+
+
+class ChatHandler(BaseHTTPRequestHandler):
+    indice: list[Trecho] = []
+
+    def log_message(self, formato, *args):
+        print(f"[servidor] {self.address_string()} - {formato % args}")
+
+    def _responder_json(self, codigo: int, corpo: dict) -> None:
+        payload = json.dumps(corpo).encode("utf-8")
+        self.send_response(codigo)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            corpo = PAGINA_CHAT.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(corpo)))
+            self.end_headers()
+            self.wfile.write(corpo)
+        elif self.path == "/favicon.ico" and FAVICON.is_file():
+            corpo = FAVICON.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/x-icon")
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.send_header("Content-Length", str(len(corpo)))
+            self.end_headers()
+            self.wfile.write(corpo)
+        else:
+            self.send_error(404, "humm 404!!")
+
+    def do_POST(self):
+        if self.path != "/api/chat":
+            self.send_error(404, "humm 404!!")
+            return
+
+        tamanho = int(self.headers.get("Content-Length", 0))
+        try:
+            dados = json.loads(self.rfile.read(tamanho) or b"{}")
+        except json.JSONDecodeError:
+            self._responder_json(400, {"erro": "JSON inválido."})
+            return
+
+        pergunta = str(dados.get("pergunta", "")).strip()
+        if not pergunta:
+            self._responder_json(400, {"erro": "Falta o campo 'pergunta'."})
+            return
+
+        resposta, _raciocinio = responder(pergunta, ChatHandler.indice)
+        self._responder_json(200, {"resposta": resposta})
+
+
+def iniciar_servidor_https(indice: list[Trecho], host: str = SERVIDOR_HOST, porta: int = SERVIDOR_PORTA) -> None:
+    """Sobe um pequeno servidor HTTPS (biblioteca padrão, sem
+    dependências extra) que serve uma página de chat em '/' e responde
+    perguntas em POST '/api/chat'."""
+    garantir_certificado()
+    ChatHandler.indice = indice
+
+    contexto_ssl = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    contexto_ssl.load_cert_chain(certfile=str(CERTIFICADO_CRT), keyfile=str(CERTIFICADO_KEY))
+
+    servidor = ThreadingHTTPServer((host, porta), ChatHandler)
+    servidor.socket = contexto_ssl.wrap_socket(servidor.socket, server_side=True)
+
+    print(f"Servidor HTTPS a correr em https://{host}:{porta}  (Ctrl+C para parar)")
+    try:
+        servidor.serve_forever()
+    except KeyboardInterrupt:
+        print("\nA encerrar servidor...")
+    finally:
+        servidor.server_close()
+
+
+def main() -> None:
+    global MOSTRAR_RACIOCINIO, _aviso_raciocinio_mostrado
+
+    argumentos = argparse.ArgumentParser(description="Agente RAG (CLI ou servidor HTTPS)")
+    argumentos.add_argument(
+        "--servidor", action="store_true",
+        help="Inicia um servidor HTTPS com página de chat, em vez do modo texto.",
+    )
+    argumentos.add_argument("--host", default=SERVIDOR_HOST, help="Endereço a escutar.")
+    argumentos.add_argument("--porta", type=int, default=SERVIDOR_PORTA, help="Porta HTTPS.")
+    args = argumentos.parse_args()
+
+    print(f"Base de conhecimento: {DOCUMENTS_DIR}")
+    print(f"A criar índice com o modelo de embeddings '{EMBEDDING_MODEL}'...")
+    try:
+        indice = criar_indice()
+    except TempoEsgotadoError as erro:
+        print(f"Não foi possível criar o índice: {erro}")
+        indice = []
+    print(f"{len(indice)} trechos indexados.")
+
+    if args.servidor:
+        iniciar_servidor_https(indice, host=args.host, porta=args.porta)
+        return
+
+    print("Comandos: /sair, /reindexar, /raciocinio")
+    while True:
+        pergunta = input("Tu: ").strip()
+        comando = pergunta.lower()
+        if comando in {"/sair", "/exit", "/quit"}:
+            break
+        if comando == "/reindexar":
+            try:
+                indice = criar_indice()
+                print(f"{len(indice)} trechos indexados.")
+            except TempoEsgotadoError as erro:
+                print(f"Não foi possível reindexar: {erro}")
+            continue
+        if comando == "/raciocinio":
+            MOSTRAR_RACIOCINIO = not MOSTRAR_RACIOCINIO
+            estado = "ativado" if MOSTRAR_RACIOCINIO else "desativado"
+            print(f"Raciocínio {estado}.")
+            continue
+        if not pergunta:
+            continue
+
+        resposta, raciocinio = responder(pergunta, indice)
+        if _raciocinio_suportado is False and MOSTRAR_RACIOCINIO and not _aviso_raciocinio_mostrado:
+            print(f"(O modelo '{MODEL}' não suporta raciocínio; a ignorar.)")
+            _aviso_raciocinio_mostrado = True
+        if raciocinio:
+            print(f"[Raciocínio]\n{raciocinio}\n")
+        print("Agente:", resposta)
+
+
+if __name__ == "__main__":
+    main()
