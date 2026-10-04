@@ -19,15 +19,15 @@ import ollama
 from pypdf import PdfReader
 
 MODEL = "hf.co/duarteocarmo/AMALIA-9B-0626-DPO-GGUF:Q4_K_M"
-#MODEL = "gemma4:e4b"
+
 EMBEDDING_MODEL = "nomic-embed-text"
 DOCUMENTS_DIR = Path(__file__).with_name("documentos")
 CHUNK_SIZE = 1800
 CHUNK_OVERLAP = 240
-TOP_K = 8
-SIMILARIDADE_MINIMA = 0.2
-PESO_EMBEDDINGS = 0.4
-PESO_JACCARD = 0.6
+TOP_K = 12
+SIMILARIDADE_MINIMA = 0.15
+PESO_EMBEDDINGS = 0.25
+PESO_JACCARD = 0.75
 EXTENSOES_TEXTO = {
     ".txt",
     ".md",
@@ -40,11 +40,16 @@ EXTENSOES_TEXTO = {
     ".c"
 }
 EXTENSOES_PDF = {".pdf"}
-TAMANHO_LOTE_EMBED = 16
+TAMANHO_LOTE_EMBED  = 16
+MAX_MENSAGENS_HISTORICO = 8
+# Janela de contexto pedida ao Ollama. O valor por defeito (2048-4096
+# tokens) é menor que o prompt (TOP_K x CHUNK_SIZE + histórico) e o Ollama
+# corta silenciosamente o excesso, perdendo o histórico.
+NUM_CTX = 16384
 FAVICON = Path(__file__).with_name("favicon.ico")
 CACHE_DB = Path(__file__).with_name("indice.db")
-TEMPO_LIMITE_OLLAMA = 120
-MOSTRAR_RACIOCINIO = False
+TEMPO_LIMITE_OLLAMA = 240
+MOSTRAR_RACIOCINIO  = False
 
 CERTIFICADO_DIR = Path(__file__).with_name("certificados")
 CERTIFICADO_CRT = CERTIFICADO_DIR / "servidor.crt"
@@ -382,39 +387,71 @@ def limpar_raciocinio_do_texto(texto: str) -> str:
     return texto
 
 
-def responder(pergunta: str, indice: list[Trecho]) -> tuple[str, str | None]:
+def normalizar_historico(historico) -> list[dict[str, str]]:
+    """Mantém só mensagens válidas (user/assistant com texto) e as mais
+    recentes. O histórico guarda apenas as perguntas e respostas
+    originais, sem o contexto recuperado, para não encher o prompt."""
+    if not isinstance(historico, list):
+        return []
+    validas = [
+        {"role": m["role"], "content": m["content"]}
+        for m in historico
+        if isinstance(m, dict)
+        and m.get("role") in {"user", "assistant"}
+        and isinstance(m.get("content"), str)
+        and m["content"].strip()
+    ]
+    return validas[-MAX_MENSAGENS_HISTORICO:]
+
+
+def responder(
+    pergunta: str,
+    indice: list[Trecho],
+    historico: list[dict[str, str]] | None = None,
+) -> tuple[str, str | None]:
     """Devolve (resposta, raciocínio). O raciocínio pode ser None se o
-    modelo não o suportar ou se `MOSTRAR_RACIOCINIO` estiver desligado."""
+    modelo não o suportar ou se `MOSTRAR_RACIOCINIO` estiver desligado.
+
+    `historico` são as mensagens anteriores da conversa (user/assistant)."""
     global _raciocinio_suportado
 
+    historico = normalizar_historico(historico)
     try:
-        contexto = recuperar(pergunta, indice)
+        # Perguntas de seguimento ("e o segundo?") não têm palavras
+        # suficientes para a pesquisa; junta-se a pergunta anterior.
+        anteriores = [m["content"] for m in historico if m["role"] == "user"]
+        consulta = f"{anteriores[-1]} {pergunta}" if anteriores else pergunta
+        contexto = recuperar(consulta, indice)
         if contexto:
             fontes = "\n\n".join(
                 f"[Fonte: {trecho.fonte}]\n{trecho.texto}" for trecho in contexto
             )
             instrucao = (
-                "Usa apenas o contexto abaixo para responder. Não mistures "
-                "informação de fontes diferentes como se fosse uma só; se "
-                "houver informação em conflito entre fontes, aponta a "
-                "diferença em vez de escolher uma ao acaso. Se a resposta "
-                "não estiver claramente no contexto, diz que não encontraste "
-                "informação suficiente — não inventes nem completes com "
-                "conhecimento próprio. Indica sempre as fontes usadas no "
-                "fim.\n\n"
-                f"Contexto:\n{fontes}\n\nPergunta: {pergunta}"
+                "Tens acesso à conversa anterior com o utilizador. Perguntas "
+                "sobre a conversa (\"repete\", \"resume\", \"e o segundo?\", "
+                "\"o que disseste?\") respondem-se com as mensagens anteriores, "
+                "ignorando o contexto abaixo. Para as restantes perguntas, usa "
+                "apenas o contexto abaixo. Não mistures informação de fontes "
+                "diferentes como se fosse uma só; se houver informação em "
+                "conflito entre fontes, aponta a diferença em vez de escolher "
+                "uma ao acaso. Se a resposta não estiver claramente no "
+                "contexto, diz que não encontraste informação suficiente — "
+                "não inventes nem completes com conhecimento próprio. Indica "
+                "sempre as fontes usadas no fim.\n\n"
+                f"Contexto:\n{fontes}"
             )
         else:
             instrucao = (
-                "Não existem documentos na base de conhecimento "
-                f"({DOCUMENTS_DIR}). Responde apenas se souberes.\n\n"
-                f"Pergunta: {pergunta}"
+                "Não existem documentos relevantes na base de conhecimento "
+                f"({DOCUMENTS_DIR}). Responde apenas se souberes, ou com base "
+                "na conversa anterior."
             )
 
         pedir_raciocinio = MOSTRAR_RACIOCINIO and _raciocinio_suportado is not False
         mensagens = [
-            {"role": "system", "content": INSTRUCAO_SISTEMA},
-            {"role": "user", "content": instrucao},
+            {"role": "system", "content": f"{INSTRUCAO_SISTEMA}\n\n{instrucao}"},
+            *historico,
+            {"role": "user", "content": pergunta},
         ]
         try:
             response = executar_com_limite(
@@ -422,6 +459,7 @@ def responder(pergunta: str, indice: list[Trecho]) -> tuple[str, str | None]:
                 model=MODEL,
                 messages=mensagens,
                 think=pedir_raciocinio,
+                options={"num_ctx": NUM_CTX},
             )
         except ollama.ResponseError as erro:
             if pedir_raciocinio and erro.status_code == 400:
@@ -431,6 +469,7 @@ def responder(pergunta: str, indice: list[Trecho]) -> tuple[str, str | None]:
                     cliente.chat,
                     model=MODEL,
                     messages=mensagens,
+                    options={"num_ctx": NUM_CTX},
                 )
             else:
                 raise
@@ -506,6 +545,7 @@ window.MathJax = {
 const historico = document.getElementById('historico');
 const form = document.getElementById('form');
 const campo = document.getElementById('pergunta');
+let conversa = [];
 
 function adicionar(classe, texto) {
   const div = document.createElement('div');
@@ -533,10 +573,14 @@ form.addEventListener('submit', async (evento) => {
     const resposta = await fetch('/api/chat', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({pergunta}),
+      body: JSON.stringify({pergunta, historico: conversa}),
     });
     const dados = await resposta.json();
     ultimo.textContent = 'Agente: ' + (dados.resposta || dados.erro || '(sem resposta)');
+    if (dados.resposta) {
+      conversa.push({role: 'user', content: pergunta}, {role: 'assistant', content: dados.resposta});
+      conversa = conversa.slice(-8);
+    }
     renderizarMatematica(ultimo);
   } catch (erro) {
     ultimo.textContent = 'Agente: erro de ligação ao servidor.';
@@ -598,7 +642,8 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._responder_json(400, {"erro": "Falta o campo 'pergunta'."})
             return
 
-        resposta, _raciocinio = responder(pergunta, ChatHandler.indice)
+        historico = normalizar_historico(dados.get("historico"))
+        resposta, _raciocinio = responder(pergunta, ChatHandler.indice, historico)
         self._responder_json(200, {"resposta": resposta})
 
 
@@ -649,7 +694,8 @@ def main() -> None:
         iniciar_servidor_https(indice, host=args.host, porta=args.porta)
         return
 
-    print("Comandos: /sair, /reindexar, /raciocinio")
+    print("Comandos: /sair, /reindexar, /limpar, /raciocinio")
+    historico: list[dict[str, str]] = []
     while True:
         pergunta = input("Tu: ").strip()
         comando = pergunta.lower()
@@ -662,6 +708,10 @@ def main() -> None:
             except TempoEsgotadoError as erro:
                 print(f"Não foi possível reindexar: {erro}")
             continue
+        if comando == "/limpar":
+            historico = []
+            print("Conversa reiniciada.")
+            continue
         if comando == "/raciocinio":
             MOSTRAR_RACIOCINIO = not MOSTRAR_RACIOCINIO
             estado = "ativado" if MOSTRAR_RACIOCINIO else "desativado"
@@ -670,7 +720,12 @@ def main() -> None:
         if not pergunta:
             continue
 
-        resposta, raciocinio = responder(pergunta, indice)
+        resposta, raciocinio = responder(pergunta, indice, historico)
+        historico += [
+            {"role": "user", "content": pergunta},
+            {"role": "assistant", "content": resposta},
+        ]
+        historico = historico[-MAX_MENSAGENS_HISTORICO:]
         if _raciocinio_suportado is False and MOSTRAR_RACIOCINIO and not _aviso_raciocinio_mostrado:
             print(f"(O modelo '{MODEL}' não suporta raciocínio; a ignorar.)")
             _aviso_raciocinio_mostrado = True
