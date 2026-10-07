@@ -18,6 +18,7 @@ Dependências Python, também listadas em `requirements.txt`:
 - `ollama` (testado com 0.6.2)
 - `httpx` (testado com 0.28.1)
 - `pypdf` (testado com 6.19.0)
+- `numpy` (pesquisa vetorizada)
 
 O restante usa a biblioteca padrão do Python, incluindo `sqlite3` para a cache dos embeddings.
 
@@ -79,14 +80,18 @@ Inicia o chat no terminal:
 ./rag
 ```
 
-Ou inicia o servidor HTTPS (por omissão, `https://0.0.0.0:8443`):
+Ou inicia o servidor HTTPS (por omissão, abre `https://localhost:8443/` no
+browser; `0.0.0.0` é o endereço de escuta e não o endereço a escrever). Noutro
+dispositivo da mesma rede, usa o endereço IP deste computador, por exemplo
+`https://192.168.50.33:8443/`:
 
 ```bash
 ./rag --servidor
 ./rag --servidor --host 127.0.0.1 --porta 9443
 ```
 
-O servidor cria um certificado autoassinado. O browser mostrará um aviso de certificado não confiável; isto é esperado para uso local. Para exposição pública, configura um certificado válido ou um proxy HTTPS, como Caddy ou nginx.
+O servidor cria um certificado autoassinado com nomes alternativos para `localhost`, `127.0.0.1` e os endereços IP locais. O browser ainda mostrará um aviso de certificado não confiável; aceita a exceção para o endereço IP antes de usar o chat. Para exposição pública, configura um certificado válido ou um proxy HTTPS, como Caddy ou nginx.
+`/api/chat` é apenas a rota POST usada pela página; abri-la diretamente no browser não abre o chat.
 
 Comandos do modo terminal:
 
@@ -122,8 +127,11 @@ O modelo é sem estado entre pedidos; o programa envia-lhe o histórico recente 
 
 - Guarda no máximo as últimas 8 mensagens (perguntas e respostas), sem repetir os trechos recuperados.
 - No modo terminal, o histórico dura até terminares o programa ou usares `/limpar`.
-- No browser, cada separador mantém uma conversa independente em memória. Atualizar a página ou abri-la novamente limpa essa conversa.
-- Perguntas de seguimento também usam a pergunta anterior na pesquisa da base de conhecimento.
+- No browser, cada separador mantém uma conversa independente em `sessionStorage`; atualizar a página mantém os últimos turnos. O botão **Limpar conversa** apaga o histórico desse separador; fechar o separador termina essa conversa.
+- Se o browser bloquear o armazenamento da sessão, as respostas continuam a ser mostradas; só a persistência do histórico fica indisponível. Os erros de rede/timeout são apresentados na conversa e na consola do browser.
+- Perguntas de seguimento usam as duas perguntas anteriores na pesquisa, e pedidos explícitos para repetir/resumir a resposta anterior são respondidos a partir do histórico sem acrescentar excertos de documentos.
+- A pesquisa ignora palavras comuns, exige correspondência de palavras de conteúdo quando existe, e só recorre a resultados puramente semânticos com `SIMILARIDADE_EMBEDDINGS_MINIMA`. Isto reduz o risco de apresentar documentos sem relação como fontes; baixa esse limiar se consultas por sinónimos deixarem de encontrar material.
+- A pesquisa limita a três trechos por ficheiro para evitar que um único PDF ocupe todo o contexto. A resposta da API inclui os caminhos dos ficheiros cujos excertos foram fornecidos ao modelo; o browser mostra-os separadamente da resposta.
 
 `NUM_CTX=16384` define a janela de contexto enviada ao Ollama. É importante que seja suficientemente grande para o histórico e os trechos recuperados; se for demasiado baixa, o Ollama pode truncar o prompt e o modelo perder parte da conversa. Uma janela maior aumenta o uso de memória.
 
@@ -137,10 +145,12 @@ Os parâmetros encontram-se no início do ficheiro `rag`:
 | `EMBEDDING_MODEL` | `nomic-embed-text` | Modelo que cria os embeddings |
 | `CHUNK_SIZE` | 1800 | Tamanho alvo dos trechos, em caracteres |
 | `CHUNK_OVERLAP` | 240 | Sobreposição entre trechos |
-| `TOP_K` | 12 | Máximo de trechos recuperados para contexto |
-| `SIMILARIDADE_MINIMA` | 0.15 | Pontuação mínima para incluir um trecho |
-| `PESO_EMBEDDINGS` | 0.25 | Peso da similaridade de cosseno na pontuação híbrida |
-| `PESO_JACCARD` | 0.75 | Peso da similaridade de Jaccard na pontuação híbrida |
+| `TOP_K` | 8 | Máximo de trechos recuperados para contexto |
+| `MAX_TRECHOS_POR_FONTE` | 3 | Máximo de trechos selecionados por ficheiro |
+| `SIMILARIDADE_MINIMA` | 0.25 | Pontuação híbrida mínima para incluir um trecho |
+| `SIMILARIDADE_EMBEDDINGS_MINIMA` | 0.68 | Semelhança mínima quando não há correspondência lexical |
+| `PESO_EMBEDDINGS` | 0.75 | Peso da similaridade de cosseno na pontuação híbrida |
+| `PESO_JACCARD` | 0.25 | Peso da cobertura lexical ponderada por IDF |
 | `TAMANHO_LOTE_EMBED` | 16 | Trechos por pedido de embeddings |
 | `MAX_MENSAGENS_HISTORICO` | 8 | Mensagens anteriores mantidas |
 | `NUM_CTX` | 16384 | Janela de contexto pedida ao Ollama |
@@ -154,7 +164,7 @@ A página web carrega MathJax 3 a partir do jsDelivr e renderiza fórmulas em li
 
 ## Resolução de problemas
 
-- **`ModuleNotFoundError` para `ollama`, `httpx` ou `pypdf`** — ativa o ambiente virtual e executa `pip install -r requirements.txt`.
+- **`ModuleNotFoundError` para `ollama`, `httpx`, `pypdf` ou `numpy`** — ativa o ambiente virtual e executa `pip install -r requirements.txt`.
 - **Ollama não responde ou ocorre timeout** — confirma `systemctl status ollama` e testa `curl http://127.0.0.1:11434/api/tags`.
 - **`connection reset by peer` durante embeddings** — confirma se o serviço Ollama continua ativo; os embeddings são enviados em lotes para reduzir sobrecarga.
 - **O modelo perde mensagens anteriores** — confirma que estás a executar a versão atual de `rag`, reinicia o servidor e mantém `NUM_CTX` suficiente para o prompt.
@@ -162,3 +172,16 @@ A página web carrega MathJax 3 a partir do jsDelivr e renderiza fórmulas em li
 - **Fórmulas não renderizadas** — MathJax depende da CDN; confirma a ligação à Internet.
 - **Avisos `Impossible to decode XFormObject`** — podem ser emitidos pelo `pypdf` ao encontrar objetos gráficos de PDFs; não significam necessariamente que a extração de texto falhou.
 - **Aviso de certificado no browser** — o certificado gerado automaticamente é autoassinado; para produção usa um certificado válido.
+
+## Desempenho
+
+- A pesquisa usa **numpy**: os embeddings ficam numa matriz normalizada (cosseno = um produto matriz-vetor) e a cobertura lexical usa um índice invertido de palavras. Com ~58 mil trechos, `recuperar` passou de ~11 s para ~0,1 s por pergunta.
+- `KEEP_ALIVE = "30m"` mantém os modelos carregados no Ollama entre perguntas.
+- O tempo restante de cada resposta é o LLM; para o reduzir, diminua `TOP_K` ou `CHUNK_SIZE` (menos contexto no prompt). Alterar `CHUNK_SIZE` obriga a reindexar tudo.
+
+## Relevância das respostas
+
+- Os excertos recuperados vão na mensagem do utilizador, imediatamente antes da pergunta, com instruções para prevalecerem sobre o conhecimento do modelo (`temperature` 0,2).
+- A componente lexical é uma cobertura ponderada por IDF (palavras raras pesam mais; as que existem em mais de `FREQUENCIA_MAXIMA_PALAVRA` dos trechos são ignoradas), em vez de Jaccard puro, que ficava diluído em trechos longos.
+- Se o modelo continuar a ignorar os documentos, aumenta `SIMILARIDADE_MINIMA` (ex.: 0.45) para só passarem trechos realmente relevantes.
+- `FATOR_PESO_PDF` e `FATOR_PESO_TEXTO` permitem ajustar separadamente o peso do tipo de ficheiro na pontuação final. `1.0` mantém a pontuação; valores acima de `1.0` favorecem esse tipo e abaixo de `1.0` penalizam-no. Por exemplo, `FATOR_PESO_PDF = 0.8` e `FATOR_PESO_TEXTO = 1.2` favorece ficheiros de texto. O ajuste não exige reindexar, mas requer reiniciar o programa/servidor.

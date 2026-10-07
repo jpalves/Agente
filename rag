@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import math
 import re
@@ -13,8 +14,10 @@ from array import array
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
+import numpy as np
 import ollama
 from pypdf import PdfReader
 
@@ -24,10 +27,14 @@ EMBEDDING_MODEL = "nomic-embed-text"
 DOCUMENTS_DIR = Path(__file__).with_name("documentos")
 CHUNK_SIZE = 1800
 CHUNK_OVERLAP = 240
-TOP_K = 12
-SIMILARIDADE_MINIMA = 0.15
-PESO_EMBEDDINGS = 0.25
-PESO_JACCARD = 0.75
+TOP_K = 8
+MAX_TRECHOS_POR_FONTE = 50
+SIMILARIDADE_MINIMA = 0.45
+PESO_EMBEDDINGS = 0.75
+PESO_JACCARD = 0.25
+# Multiplicadores por tipo de ficheiro: >1 favorece, <1 penaliza.
+FATOR_PESO_PDF = 1.
+FATOR_PESO_TEXTO = 1.
 EXTENSOES_TEXTO = {
     ".txt",
     ".md",
@@ -41,11 +48,19 @@ EXTENSOES_TEXTO = {
 }
 EXTENSOES_PDF = {".pdf"}
 TAMANHO_LOTE_EMBED  = 16
-MAX_MENSAGENS_HISTORICO = 8
+MAX_MENSAGENS_HISTORICO = 1
+# Mantém os modelos carregados em memória entre perguntas (por defeito o
+# Ollama descarrega-os ao fim de 5 minutos e recarregá-los demora segundos).
+KEEP_ALIVE = "30m"
+# Palavras presentes em mais desta fração dos trechos são ignoradas no Jaccard.
+FREQUENCIA_MAXIMA_PALAVRA = 0.005
+# Quando não há correspondência lexical, exige-se uma semelhança semântica
+# mais forte para evitar apresentar documentos aleatórios como fontes.
+SIMILARIDADE_EMBEDDINGS_MINIMA = 0.48
 # Janela de contexto pedida ao Ollama. O valor por defeito (2048-4096
 # tokens) é menor que o prompt (TOP_K x CHUNK_SIZE + histórico) e o Ollama
 # corta silenciosamente o excesso, perdendo o histórico.
-NUM_CTX = 16384
+NUM_CTX = 65536
 FAVICON = Path(__file__).with_name("favicon.ico")
 CACHE_DB = Path(__file__).with_name("indice.db")
 TEMPO_LIMITE_OLLAMA = 240
@@ -89,7 +104,109 @@ def executar_com_limite(funcao, *args, **kwargs):
 class Trecho:
     texto: str
     fonte: str
-    vetor: list[float]
+
+
+def palavras(texto: str) -> set[str]:
+    return set(re.findall(r"\w+", texto.casefold()))
+
+
+PALAVRAS_COMUNS = set(
+    "a ao aos aquela aquelas aquele aqueles aquilo as até com como da das de "
+    "dela delas dele deles depois do dos e ela elas ele eles em entre era essa "
+    "essas esse esses esta estas este estes eu foi foram há isso isto já lhe "
+    "mais mas me mesmo minha minhas muito na nas nem no nos nossa nossas nosso "
+    "nossos num numa o os ou para pela pelas pelo pelos por qual quando que "
+    "quem se sem ser seu seus si sob sobre sua suas também te tem tinha tu um "
+    "uma umas uns vos vós você vocês projeto project complexidade complexity "
+    "why what where when which who whom whose "
+    "how is are was were be been being a an the and or but if then than of in "
+    "on at to for from with by as it its this that these those".split()
+)
+
+
+def palavras_conteudo(texto: str) -> set[str]:
+    return palavras(texto) - PALAVRAS_COMUNS
+
+
+class Indice:
+    """Índice em memória preparado para pesquisa rápida.
+
+    - `matriz`: embeddings normalizados (N x D), para calcular o cosseno
+      de todos os trechos com um único produto matriz-vetor;
+    - `invertido`: palavra -> ids dos trechos que a contêm, para calcular
+      o Jaccard sem voltar a tokenizar os trechos a cada pergunta."""
+
+    def __init__(self, trechos: list[Trecho], matriz: np.ndarray):
+        self.trechos = trechos
+        normas = np.linalg.norm(matriz, axis=1, keepdims=True)
+        self.matriz = matriz / np.where(normas == 0, 1, normas)
+        self.fatores_tipo = np.array(
+            [
+                FATOR_PESO_PDF
+                if Path(trecho.fonte).suffix.lower() in EXTENSOES_PDF
+                else FATOR_PESO_TEXTO
+                if Path(trecho.fonte).suffix.lower() in EXTENSOES_TEXTO
+                else 1.0
+                for trecho in trechos
+            ],
+            dtype=np.float32,
+        )
+        self.n_palavras = np.zeros(len(trechos), dtype=np.int32)
+        listas: dict[str, list[int]] = {}
+        for numero, trecho in enumerate(trechos):
+            conjunto = palavras_conteudo(trecho.texto)
+            self.n_palavras[numero] = len(conjunto)
+            for palavra in conjunto:
+                listas.setdefault(palavra, []).append(numero)
+        # palavras presentes em muitos trechos ("de", "que", "para"...) não
+        # distinguem nada e fazem o Jaccard favorecer trechos longos ao acaso
+        limite = max(50, int(FREQUENCIA_MAXIMA_PALAVRA * len(trechos)))
+        for palavra, ids in listas.items():
+            if len(ids) > limite:
+                self.n_palavras[ids] -= 1
+        self.invertido = {
+            palavra: np.array(ids, dtype=np.int32)
+            for palavra, ids in listas.items()
+            if len(ids) <= limite
+        }
+
+    def __len__(self) -> int:
+        return len(self.trechos)
+
+    def ids_com_correspondencia_lexica(self, pergunta: str) -> np.ndarray:
+        ids = [
+            self.invertido[p]
+            for p in palavras_conteudo(pergunta)
+            if p in self.invertido
+        ]
+        return np.unique(np.concatenate(ids)) if ids else np.array([], dtype=np.int32)
+
+    def similaridades_embeddings(self, vetor_pergunta: list[float]) -> np.ndarray:
+        vetor = np.asarray(vetor_pergunta, dtype=np.float32)
+        norma = np.linalg.norm(vetor)
+        return self.matriz @ (vetor / norma if norma else vetor)
+
+    def pontuacoes(self, pergunta: str, vetor_pergunta: list[float]) -> np.ndarray:
+        """Pontuação híbrida (cosseno + Jaccard) de todos os trechos."""
+        cosseno = self.similaridades_embeddings(vetor_pergunta)
+
+        # Cobertura ponderada por IDF: fração da "informação" das palavras da
+        # pergunta presente no trecho. Palavras raras ("quicksort") pesam
+        # muito; palavras comuns ("que", "é") quase nada. É mais robusta que
+        # o Jaccard puro, que dilui a pontuação em trechos longos.
+        cobertura = np.zeros(len(self.trechos), dtype=np.float32)
+        total = 0.0
+        for palavra in palavras_conteudo(pergunta):
+            ids = self.invertido.get(palavra)
+            if ids is None:
+                continue
+            peso = math.log(len(self.trechos) / len(ids))
+            cobertura[ids] += peso
+            total += peso
+        jaccard = cobertura / total if total else cobertura
+
+        return (PESO_EMBEDDINGS * cosseno + PESO_JACCARD * jaccard) * self.fatores_tipo
+
 
 def dividir_em_trechos(texto: str) -> list[str]:
     """Divide um documento em parágrafos/frases, agrupando-os até ao
@@ -138,30 +255,6 @@ def dividir_em_trechos(texto: str) -> list[str]:
         vistos.add(chave)
         trechos_unicos.append(trecho)
     return trechos_unicos
-
-
-def similaridade(vetor_a: list[float], vetor_b: list[float]) -> float:
-    produto = sum(a * b for a, b in zip(vetor_a, vetor_b))
-    norma_a = math.sqrt(sum(a * a for a in vetor_a))
-    norma_b = math.sqrt(sum(b * b for b in vetor_b))
-    
-    return produto / (norma_a * norma_b) if norma_a and norma_b else 0.0
-
-
-def similaridade_jaccard(texto_a: str, texto_b: str) -> float:
-    """Compara a proporção de palavras partilhadas entre dois textos."""
-    palavras_a = set(re.findall(r"\w+", texto_a.casefold()))
-    palavras_b = set(re.findall(r"\w+", texto_b.casefold()))
-    uniao = palavras_a | palavras_b
-    return len(palavras_a & palavras_b) / len(uniao) if uniao else 0.0
-
-
-def pontuacao_relevancia(
-    pergunta: str, vetor_pergunta: list[float], trecho: Trecho
-) -> float:
-    score_embeddings = similaridade(vetor_pergunta, trecho.vetor)
-    score_jaccard = similaridade_jaccard(pergunta, trecho.texto)
-    return PESO_EMBEDDINGS * score_embeddings + PESO_JACCARD * score_jaccard
 
 
 def remover_surrogates_invalidos(texto: str) -> str:
@@ -246,7 +339,7 @@ def _gerar_embeddings(textos: list[str]) -> list[list[float]] | None:
     return vetores
 
 
-def criar_indice() -> list[Trecho]:
+def criar_indice() -> Indice:
     """Devolve o índice da pasta de documentos, usando uma cache SQLite.
 
     Só os ficheiros novos ou modificados (mtime/tamanho) são relidos e
@@ -254,7 +347,7 @@ def criar_indice() -> list[Trecho]:
     diretamente da base de dados."""
     if not DOCUMENTS_DIR.exists():
         DOCUMENTS_DIR.mkdir()
-        return []
+        return Indice([], np.zeros((0, 1), dtype=np.float32))
 
     extensoes_suportadas = EXTENSOES_TEXTO | EXTENSOES_PDF
     ficheiros = {
@@ -275,18 +368,23 @@ def criar_indice() -> list[Trecho]:
             ligacao.execute("DELETE FROM ficheiros WHERE caminho = ?", (caminho,))
         ligacao.commit()
 
-        indice: list[Trecho] = []
+        trechos: list[Trecho] = []
+        blocos: list[np.ndarray] = []
         novos = 0
         for caminho, ficheiro in sorted(ficheiros.items()):
             estado = ficheiro.stat()
             assinatura = (estado.st_mtime_ns, estado.st_size)
             if em_cache.get(caminho) == assinatura:
-                for texto, blob in ligacao.execute(
-                    "SELECT texto, vetor FROM trechos WHERE caminho = ?", (caminho,)
-                ):
-                    vetor = array("f")
-                    vetor.frombytes(blob)
-                    indice.append(Trecho(texto, caminho, vetor.tolist()))
+                linhas = ligacao.execute(
+                    "SELECT texto, vetor FROM trechos WHERE caminho = ? ORDER BY id",
+                    (caminho,),
+                ).fetchall()
+                if linhas:
+                    trechos.extend(Trecho(texto, caminho) for texto, _ in linhas)
+                    blocos.append(
+                        np.frombuffer(b"".join(b for _, b in linhas), dtype=np.float32)
+                        .reshape(len(linhas), -1)
+                    )
                 continue
 
             try:
@@ -312,39 +410,53 @@ def criar_indice() -> list[Trecho]:
                 ],
             )
             ligacao.commit()  # progresso guardado ficheiro a ficheiro
-            indice.extend(
-                Trecho(texto, caminho, vetor) for texto, vetor in zip(textos, vetores)
-            )
+            if textos:
+                trechos.extend(Trecho(texto, caminho) for texto in textos)
+                blocos.append(np.asarray(vetores, dtype=np.float32))
             novos += 1
         if novos:
             print(f"{novos} ficheiro(s) novos/alterados indexados.")
-        return indice
+        if not trechos:
+            return Indice([], np.zeros((0, 1), dtype=np.float32))
+        return Indice(trechos, np.vstack(blocos))
     finally:
         ligacao.close()
 
 
-def recuperar(pergunta: str, indice: list[Trecho]) -> list[Trecho]:
-    if not indice:
+def recuperar(pergunta: str, indice: Indice) -> list[Trecho]:
+    if not len(indice):
         return []
     vetor_pergunta = executar_com_limite(
-        cliente.embed, model=EMBEDDING_MODEL, input=pergunta
+        cliente.embed,
+        model=EMBEDDING_MODEL,
+        input=pergunta,
+        keep_alive=KEEP_ALIVE,
     )["embeddings"][0]
-    candidatos = sorted(
-        (
-            (pontuacao_relevancia(pergunta, vetor_pergunta, trecho), trecho)
-            for trecho in indice
-        ),
-        key=lambda candidato: candidato[0],
-        reverse=True,
-    )
+    pontuacao = indice.pontuacoes(pergunta, vetor_pergunta)
     # só considera trechos suficientemente relevantes, para não "encher"
     # o contexto com resultados fracos que confundem o modelo
-    relevantes = [
-        trecho
-        for pontuacao, trecho in candidatos
-        if pontuacao >= SIMILARIDADE_MINIMA
-    ]
-    return relevantes[:TOP_K]
+    candidatos = np.flatnonzero(pontuacao >= SIMILARIDADE_MINIMA)
+    ids_lexicos = indice.ids_com_correspondencia_lexica(pergunta)
+    if ids_lexicos.size:
+        candidatos = np.intersect1d(candidatos, ids_lexicos, assume_unique=True)
+    else:
+        similaridades = indice.similaridades_embeddings(vetor_pergunta)
+        candidatos = candidatos[
+            similaridades[candidatos] >= SIMILARIDADE_EMBEDDINGS_MINIMA
+        ]
+    ordenados = candidatos[np.argsort(-pontuacao[candidatos], kind="stable")]
+    resultados: list[Trecho] = []
+    por_fonte: dict[str, int] = {}
+    for numero in ordenados:
+        trecho = indice.trechos[numero]
+        quantidade = por_fonte.get(trecho.fonte, 0)
+        if quantidade >= MAX_TRECHOS_POR_FONTE:
+            continue
+        resultados.append(trecho)
+        por_fonte[trecho.fonte] = quantidade + 1
+        if len(resultados) >= TOP_K:
+            break
+    return resultados
 
 
 INSTRUCAO_SISTEMA = (
@@ -404,11 +516,31 @@ def normalizar_historico(historico) -> list[dict[str, str]]:
     return validas[-MAX_MENSAGENS_HISTORICO:]
 
 
+def refere_se_a_resposta_anterior(pergunta: str) -> bool:
+    return bool(
+        re.fullmatch(
+            r"\s*(?:repete|resume|continua|desenvolve|"
+            r"explica melhor|podes repetir|podes explicar melhor)\s*[.!?]*\s*",
+            pergunta.casefold(),
+        )
+        or re.search(
+            r"\b(repete (?:a )?(?:resposta|o que disseste)|"
+            r"resume (?:a )?(?:resposta|conversa|o que disseste)|"
+            r"o que disseste|qual foi a resposta|"
+            r"na resposta anterior|na pergunta anterior|"
+            r"explica melhor (?:isso|a resposta|o que disseste)|"
+            r"podes repetir (?:isso|a resposta)|"
+            r"podes explicar melhor (?:isso|a resposta))\b",
+            pergunta.casefold(),
+        )
+    )
+
+
 def responder(
     pergunta: str,
-    indice: list[Trecho],
+    indice: Indice,
     historico: list[dict[str, str]] | None = None,
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, list[str]]:
     """Devolve (resposta, raciocínio). O raciocínio pode ser None se o
     modelo não o suportar ou se `MOSTRAR_RACIOCINIO` estiver desligado.
 
@@ -417,41 +549,52 @@ def responder(
 
     historico = normalizar_historico(historico)
     try:
-        # Perguntas de seguimento ("e o segundo?") não têm palavras
-        # suficientes para a pesquisa; junta-se a pergunta anterior.
+        # Preserva o tópico nas perguntas de seguimento sem juntar toda a
+        # conversa à pesquisa e diluir a relevância dos resultados.
         anteriores = [m["content"] for m in historico if m["role"] == "user"]
-        consulta = f"{anteriores[-1]} {pergunta}" if anteriores else pergunta
-        contexto = recuperar(consulta, indice)
+        usar_historico = bool(anteriores) and refere_se_a_resposta_anterior(pergunta)
+        consulta = " ".join([*anteriores[-2:], pergunta])
+        contexto = [] if usar_historico else recuperar(consulta, indice)
         if contexto:
+            fontes_por_nome = list(dict.fromkeys(t.fonte for t in contexto))
+            numeros_fontes = {nome: i + 1 for i, nome in enumerate(fontes_por_nome)}
             fontes = "\n\n".join(
-                f"[Fonte: {trecho.fonte}]\n{trecho.texto}" for trecho in contexto
+                f"[Fonte {numeros_fontes[trecho.fonte]}: {trecho.fonte}]\n"
+                f"{trecho.texto}"
+                for trecho in contexto
             )
             instrucao = (
-                "Tens acesso à conversa anterior com o utilizador. Perguntas "
-                "sobre a conversa (\"repete\", \"resume\", \"e o segundo?\", "
-                "\"o que disseste?\") respondem-se com as mensagens anteriores, "
-                "ignorando o contexto abaixo. Para as restantes perguntas, usa "
-                "apenas o contexto abaixo. Não mistures informação de fontes "
-                "diferentes como se fosse uma só; se houver informação em "
-                "conflito entre fontes, aponta a diferença em vez de escolher "
-                "uma ao acaso. Se a resposta não estiver claramente no "
-                "contexto, diz que não encontraste informação suficiente — "
-                "não inventes nem completes com conhecimento próprio. Indica "
-                "sempre as fontes usadas no fim.\n\n"
-                f"Contexto:\n{fontes}"
+                "Usa primeiro o histórico para resolver referências como "
+                "\"isso\" ou \"o segundo\". Para responder à pergunta atual "
+                "sobre documentos, usa apenas os excertos identificados por "
+                "[Fonte N]; cada afirmação sobre os documentos deve ter uma "
+                "citação [Fonte N] correspondente. Não inventes citações nem "
+                "atribuições. Se os excertos não responderem, diz claramente "
+                "que não encontraste essa informação. Se as fontes "
+                "discordarem, explica a diferença."
+            )
+            pergunta_modelo = (
+                f"EXCERTOS RECUPERADOS:\n{fontes}\n\n"
+                f"PERGUNTA ATUAL: {pergunta}"
             )
         else:
             instrucao = (
-                "Não existem documentos relevantes na base de conhecimento "
-                f"({DOCUMENTS_DIR}). Responde apenas se souberes, ou com base "
-                "na conversa anterior."
+                "Responde apenas com base no histórico da conversa; não "
+                "consultes nem inventes fontes documentais."
+                if usar_historico
+                else
+                "A pesquisa não encontrou excertos relevantes nos documentos. "
+                "Não afirmes que consultaste fontes. Responde com base no "
+                "histórico se a pergunta se referir à conversa; caso contrário, "
+                "diz que não encontraste informação nos documentos."
             )
+            pergunta_modelo = pergunta
 
         pedir_raciocinio = MOSTRAR_RACIOCINIO and _raciocinio_suportado is not False
         mensagens = [
             {"role": "system", "content": f"{INSTRUCAO_SISTEMA}\n\n{instrucao}"},
             *historico,
-            {"role": "user", "content": pergunta},
+            {"role": "user", "content": pergunta_modelo},
         ]
         try:
             response = executar_com_limite(
@@ -459,7 +602,8 @@ def responder(
                 model=MODEL,
                 messages=mensagens,
                 think=pedir_raciocinio,
-                options={"num_ctx": NUM_CTX},
+                options={"num_ctx": NUM_CTX, "temperature": 0.2},
+                keep_alive=KEEP_ALIVE,
             )
         except ollama.ResponseError as erro:
             if pedir_raciocinio and erro.status_code == 400:
@@ -469,7 +613,8 @@ def responder(
                     cliente.chat,
                     model=MODEL,
                     messages=mensagens,
-                    options={"num_ctx": NUM_CTX},
+                    options={"num_ctx": NUM_CTX, "temperature": 0.2},
+                    keep_alive=KEEP_ALIVE,
                 )
             else:
                 raise
@@ -478,9 +623,9 @@ def responder(
             _raciocinio_suportado = True
         raciocinio = response["message"].get("thinking") if pedir_raciocinio else None
         conteudo = limpar_raciocinio_do_texto(response["message"]["content"])
-        return conteudo, raciocinio
+        return conteudo, raciocinio, list(dict.fromkeys(t.fonte for t in contexto))
     except TempoEsgotadoError as erro:
-        return f"Tempo esgotado: {erro} Tenta novamente.", None
+        return f"Tempo esgotado: {erro} Tenta novamente.", None, []
 
 
 
@@ -489,8 +634,35 @@ def garantir_certificado() -> None:
     Suficiente para desenvolvimento/uso na rede local; navegadores vão
     mostrar um aviso de "certificado não confiável" por não ser emitido
     por uma autoridade reconhecida."""
+    enderecos = {ipaddress.ip_address("127.0.0.1")}
+    saida = subprocess.run(
+        ["hostname", "-I"], check=True, capture_output=True, text=True
+    ).stdout
+    for valor in saida.split():
+        try:
+            enderecos.add(ipaddress.ip_address(valor))
+        except ValueError:
+            continue
+
+    extensoes_san = {"DNS:localhost"}
+    extensoes_san.update(
+        f"IP:{endereco}" for endereco in sorted(enderecos, key=str)
+    )
+    extensao_san = "subjectAltName=" + ",".join(sorted(extensoes_san))
+
     if CERTIFICADO_CRT.exists() and CERTIFICADO_KEY.exists():
-        return
+        certificado = subprocess.run(
+            ["openssl", "x509", "-in", str(CERTIFICADO_CRT), "-noout", "-ext", "subjectAltName"],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+        nomes_exibidos = {
+            nome.replace("IP:", "IP Address:")
+            for nome in extensoes_san
+        }
+        if all(nome in certificado for nome in nomes_exibidos):
+            return
 
     CERTIFICADO_DIR.mkdir(exist_ok=True)
     subprocess.run(
@@ -500,6 +672,7 @@ def garantir_certificado() -> None:
             "-out", str(CERTIFICADO_CRT),
             "-days", "365", "-nodes",
             "-subj", "/CN=localhost",
+            "-addext", extensao_san,
         ],
         check=True,
         capture_output=True,
@@ -529,6 +702,7 @@ window.MathJax = {
   .msg { margin-bottom: 0.75rem; white-space: pre-wrap; }
   .tu { color: #0a5; }
   .agente { color: #333; }
+  .fontes { color: #555; font-size: 0.9rem; margin: -0.4rem 0 0.8rem; }
   form { display: flex; gap: 0.5rem; }
   input { flex: 1; padding: 0.5rem; }
   button { padding: 0.5rem 1rem; }
@@ -540,12 +714,16 @@ window.MathJax = {
   <form id="form">
     <input id="pergunta" autocomplete="off" placeholder="Escreve a tua pergunta..." />
     <button type="submit">Enviar</button>
+    <button id="limpar" type="button">Limpar conversa</button>
   </form>
 <script>
 const historico = document.getElementById('historico');
 const form = document.getElementById('form');
 const campo = document.getElementById('pergunta');
+const botaoEnviar = form.querySelector('button[type="submit"]');
+const botaoLimpar = document.getElementById('limpar');
 let conversa = [];
+const chaveConversa = 'agente-rag-conversa';
 
 function adicionar(classe, texto) {
   const div = document.createElement('div');
@@ -561,29 +739,97 @@ function renderizarMatematica(elemento) {
   }
 }
 
+function guardarConversa() {
+  try {
+    sessionStorage.setItem(chaveConversa, JSON.stringify(conversa));
+    return true;
+  } catch (erro) {
+    console.error('Não foi possível guardar o histórico da conversa:', erro);
+    return false;
+  }
+}
+
+function restaurarConversa() {
+  try {
+    const guardada = JSON.parse(sessionStorage.getItem(chaveConversa) || '[]');
+    conversa = Array.isArray(guardada)
+      ? guardada.filter(m => m && ['user', 'assistant'].includes(m.role) &&
+          typeof m.content === 'string' && m.content.trim()).slice(-8)
+      : [];
+  } catch (erro) {
+    conversa = [];
+    console.error('Não foi possível restaurar o histórico da conversa:', erro);
+  }
+  for (const mensagem of conversa) {
+    adicionar(mensagem.role === 'user' ? 'tu' : 'agente',
+      (mensagem.role === 'user' ? 'Tu: ' : 'Agente: ') + mensagem.content);
+  }
+}
+
+botaoLimpar.addEventListener('click', () => {
+  conversa = [];
+  try {
+    sessionStorage.removeItem(chaveConversa);
+  } catch (erro) {
+    console.error('Não foi possível limpar o histórico guardado:', erro);
+  }
+  historico.replaceChildren();
+});
+
+restaurarConversa();
+
 form.addEventListener('submit', async (evento) => {
   evento.preventDefault();
+  if (botaoEnviar.disabled) return;
   const pergunta = campo.value.trim();
   if (!pergunta) return;
   adicionar('tu', 'Tu: ' + pergunta);
   campo.value = '';
   adicionar('agente', 'Agente: ...');
   const ultimo = historico.lastElementChild;
+  botaoEnviar.disabled = true;
+  botaoLimpar.disabled = true;
   try {
-    const resposta = await fetch('/api/chat', {
+    const controlador = new AbortController();
+    const temporizador = setTimeout(() => controlador.abort(), 260000);
+    let resposta;
+    try {
+      resposta = await fetch('/api/chat', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({pergunta, historico: conversa}),
-    });
+        signal: controlador.signal,
+      });
+    } finally {
+      clearTimeout(temporizador);
+    }
     const dados = await resposta.json();
+    if (!resposta.ok) throw new Error(dados.erro || 'Erro no servidor.');
     ultimo.textContent = 'Agente: ' + (dados.resposta || dados.erro || '(sem resposta)');
     if (dados.resposta) {
-      conversa.push({role: 'user', content: pergunta}, {role: 'assistant', content: dados.resposta});
+      const fontes = Array.isArray(dados.fontes) ? dados.fontes : [];
+      const respostaGuardada = dados.resposta +
+        (fontes.length ? '\\n\\nFontes consultadas: ' + fontes.join(', ') : '');
+      conversa.push({role: 'user', content: pergunta}, {role: 'assistant', content: respostaGuardada});
       conversa = conversa.slice(-8);
+      guardarConversa();
+      if (fontes.length) {
+        const lista = document.createElement('div');
+        lista.className = 'msg fontes';
+        lista.textContent = 'Excerto(s) fornecido(s): ' + fontes.join(', ');
+        ultimo.after(lista);
+      }
     }
     renderizarMatematica(ultimo);
   } catch (erro) {
-    ultimo.textContent = 'Agente: erro de ligação ao servidor.';
+    const mensagem = erro.name === 'AbortError'
+      ? 'O pedido demorou demasiado tempo. Tenta novamente.'
+      : `Não foi possível obter uma resposta do servidor (${erro.message || erro}).`;
+    ultimo.textContent = 'Agente: ' + mensagem;
+    console.error(mensagem, erro);
+  } finally {
+    botaoEnviar.disabled = false;
+    botaoLimpar.disabled = false;
   }
 });
 </script>
@@ -593,7 +839,7 @@ form.addEventListener('submit', async (evento) => {
 
 
 class ChatHandler(BaseHTTPRequestHandler):
-    indice: list[Trecho] = []
+    indice: Indice | list = []
 
     def log_message(self, formato, *args):
         print(f"[servidor] {self.address_string()} - {formato % args}")
@@ -607,14 +853,16 @@ class ChatHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
+        path = urlsplit(self.path).path
+        if path in ("/", "/index.html"):
             corpo = PAGINA_CHAT.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(corpo)))
             self.end_headers()
             self.wfile.write(corpo)
-        elif self.path == "/favicon.ico" and FAVICON.is_file():
+        elif path == "/favicon.ico" and FAVICON.is_file():
             corpo = FAVICON.read_bytes()
             self.send_response(200)
             self.send_header("Content-Type", "image/x-icon")
@@ -622,12 +870,28 @@ class ChatHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(corpo)))
             self.end_headers()
             self.wfile.write(corpo)
+        elif path == "/api/chat":
+            self.send_response(405)
+            self.send_header("Allow", "POST")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            corpo = json.dumps(
+                {
+                    "erro": "A API aceita apenas POST. Abre a página do chat em /."
+                }
+            ).encode("utf-8")
+            self.send_header("Content-Length", str(len(corpo)))
+            self.end_headers()
+            self.wfile.write(corpo)
         else:
-            self.send_error(404, "humm 404!!")
+            self.send_error(
+                404,
+                f"Rota não encontrada: {path}. Abre a página do chat em /.",
+            )
 
     def do_POST(self):
-        if self.path != "/api/chat":
-            self.send_error(404, "humm 404!!")
+        path = urlsplit(self.path).path
+        if path != "/api/chat":
+            self.send_error(404, f"Rota não encontrada: {path}.")
             return
 
         tamanho = int(self.headers.get("Content-Length", 0))
@@ -643,11 +907,13 @@ class ChatHandler(BaseHTTPRequestHandler):
             return
 
         historico = normalizar_historico(dados.get("historico"))
-        resposta, _raciocinio = responder(pergunta, ChatHandler.indice, historico)
-        self._responder_json(200, {"resposta": resposta})
+        resposta, _raciocinio, fontes = responder(
+            pergunta, ChatHandler.indice, historico
+        )
+        self._responder_json(200, {"resposta": resposta, "fontes": fontes})
 
 
-def iniciar_servidor_https(indice: list[Trecho], host: str = SERVIDOR_HOST, porta: int = SERVIDOR_PORTA) -> None:
+def iniciar_servidor_https(indice: Indice, host: str = SERVIDOR_HOST, porta: int = SERVIDOR_PORTA) -> None:
     """Sobe um pequeno servidor HTTPS (biblioteca padrão, sem
     dependências extra) que serve uma página de chat em '/' e responde
     perguntas em POST '/api/chat'."""
@@ -687,7 +953,7 @@ def main() -> None:
         indice = criar_indice()
     except TempoEsgotadoError as erro:
         print(f"Não foi possível criar o índice: {erro}")
-        indice = []
+        indice = Indice([], np.zeros((0, 1), dtype=np.float32))
     print(f"{len(indice)} trechos indexados.")
 
     if args.servidor:
@@ -720,7 +986,7 @@ def main() -> None:
         if not pergunta:
             continue
 
-        resposta, raciocinio = responder(pergunta, indice, historico)
+        resposta, raciocinio, fontes = responder(pergunta, indice, historico)
         historico += [
             {"role": "user", "content": pergunta},
             {"role": "assistant", "content": resposta},
@@ -732,6 +998,8 @@ def main() -> None:
         if raciocinio:
             print(f"[Raciocínio]\n{raciocinio}\n")
         print("Agente:", resposta)
+        if fontes:
+            print("Fontes:", ", ".join(fontes))
 
 
 if __name__ == "__main__":
