@@ -27,14 +27,14 @@ EMBEDDING_MODEL = "nomic-embed-text"
 DOCUMENTS_DIR = Path(__file__).with_name("documentos")
 CHUNK_SIZE = 1800
 CHUNK_OVERLAP = 240
-TOP_K = 8
-MAX_TRECHOS_POR_FONTE = 50
-SIMILARIDADE_MINIMA = 0.45
+TOP_K = 16
+MAX_TRECHOS_POR_FONTE = 40
+SIMILARIDADE_MINIMA = 0.55
 PESO_EMBEDDINGS = 0.75
 PESO_JACCARD = 0.25
 # Multiplicadores por tipo de ficheiro: >1 favorece, <1 penaliza.
-FATOR_PESO_PDF = 1.
-FATOR_PESO_TEXTO = 1.
+FATOR_PESO_PDF = .4
+FATOR_PESO_TEXTO = .4
 EXTENSOES_TEXTO = {
     ".txt",
     ".md",
@@ -56,7 +56,7 @@ KEEP_ALIVE = "30m"
 FREQUENCIA_MAXIMA_PALAVRA = 0.005
 # Quando não há correspondência lexical, exige-se uma semelhança semântica
 # mais forte para evitar apresentar documentos aleatórios como fontes.
-SIMILARIDADE_EMBEDDINGS_MINIMA = 0.48
+SIMILARIDADE_EMBEDDINGS_MINIMA = 0.58
 # Janela de contexto pedida ao Ollama. O valor por defeito (2048-4096
 # tokens) é menor que o prompt (TOP_K x CHUNK_SIZE + histórico) e o Ollama
 # corta silenciosamente o excesso, perdendo o histórico.
@@ -423,39 +423,92 @@ def criar_indice() -> Indice:
         ligacao.close()
 
 
+_TRADUCOES: dict[str, str] = {}
+
+
+def traduzir_consulta(pergunta: str) -> str:
+    """Traduz a pergunta para inglês (a maioria das fontes está em inglês)."""
+    if pergunta in _TRADUCOES:
+        return _TRADUCOES[pergunta]
+    traducao = ""
+    try:
+        resposta = executar_com_limite(
+            cliente.chat,
+            model=MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Translate to English, keeping technical terms. "
+                    "Reply with the translation only:\n" + pergunta,
+                }
+            ],
+            options={"temperature": 0, "num_predict": 80},
+            keep_alive=KEEP_ALIVE,
+        )
+        traducao = resposta["message"]["content"].strip().splitlines()[0]
+    except Exception:
+        pass
+    if len(_TRADUCOES) > 200:
+        _TRADUCOES.clear()
+    _TRADUCOES[pergunta] = traducao
+    return traducao
+
+
 def recuperar(pergunta: str, indice: Indice) -> list[Trecho]:
     if not len(indice):
         return []
-    vetor_pergunta = executar_com_limite(
-        cliente.embed,
-        model=EMBEDDING_MODEL,
-        input=pergunta,
-        keep_alive=KEEP_ALIVE,
-    )["embeddings"][0]
-    pontuacao = indice.pontuacoes(pergunta, vetor_pergunta)
-    # só considera trechos suficientemente relevantes, para não "encher"
-    # o contexto com resultados fracos que confundem o modelo
-    candidatos = np.flatnonzero(pontuacao >= SIMILARIDADE_MINIMA)
-    ids_lexicos = indice.ids_com_correspondencia_lexica(pergunta)
-    if ids_lexicos.size:
-        candidatos = np.intersect1d(candidatos, ids_lexicos, assume_unique=True)
-    else:
-        similaridades = indice.similaridades_embeddings(vetor_pergunta)
+    consultas = [pergunta]
+    traducao = traduzir_consulta(pergunta)
+    if traducao and traducao.lower() != pergunta.lower():
+        consultas.append(traducao)
+    pontuacao = np.zeros(len(indice), dtype=np.float32)
+    similaridades = np.zeros(len(indice), dtype=np.float32)
+    tem_lexico = np.zeros(len(indice), dtype=bool)
+    # Cada consulta (original e traduzida) é avaliada; fica o melhor resultado
+    for consulta in consultas:
+        vetor = executar_com_limite(
+            cliente.embed,
+            model=EMBEDDING_MODEL,
+            input=consulta,
+            keep_alive=KEEP_ALIVE,
+        )["embeddings"][0]
+        pontuacao = np.maximum(pontuacao, indice.pontuacoes(consulta, vetor))
+        similaridades = np.maximum(
+            similaridades, indice.similaridades_embeddings(vetor)
+        )
+        tem_lexico[indice.ids_com_correspondencia_lexica(consulta)] = True
+    # Um trecho é candidato se a pontuação híbrida chega ao limiar E há
+    # correspondência de palavras, ou se é semanticamente muito próximo
+    # mesmo sem a palavra exata (sinónimos, outro idioma, outras fontes).
+    candidatos = np.flatnonzero(
+        ((pontuacao >= SIMILARIDADE_MINIMA) & tem_lexico)
+        | (similaridades >= SIMILARIDADE_EMBEDDINGS_MINIMA)
+    )
+    if candidatos.size:
+        # descarta o que ficou muito abaixo do melhor resultado
         candidatos = candidatos[
-            similaridades[candidatos] >= SIMILARIDADE_EMBEDDINGS_MINIMA
+            pontuacao[candidatos] >= 0.8 * pontuacao[candidatos].max()
         ]
     ordenados = candidatos[np.argsort(-pontuacao[candidatos], kind="stable")]
-    resultados: list[Trecho] = []
-    por_fonte: dict[str, int] = {}
+
+    # Seleção por rondas: primeiro o melhor trecho de cada fonte (por ordem
+    # de relevância), depois o segundo melhor de cada uma, etc. Garante
+    # que todas as fontes relevantes são representadas em vez de uma única
+    # fonte ocupar o contexto.
+    por_fonte: dict[str, list[int]] = {}
     for numero in ordenados:
-        trecho = indice.trechos[numero]
-        quantidade = por_fonte.get(trecho.fonte, 0)
-        if quantidade >= MAX_TRECHOS_POR_FONTE:
-            continue
-        resultados.append(trecho)
-        por_fonte[trecho.fonte] = quantidade + 1
-        if len(resultados) >= TOP_K:
-            break
+        lista = por_fonte.setdefault(indice.trechos[numero].fonte, [])
+        if len(lista) < MAX_TRECHOS_POR_FONTE:
+            lista.append(int(numero))
+    resultados: list[Trecho] = []
+    ronda = 0
+    while len(resultados) < TOP_K and any(len(v) > ronda for v in por_fonte.values()):
+        da_ronda = sorted(
+            (v[ronda] for v in por_fonte.values() if len(v) > ronda),
+            key=lambda n: -pontuacao[n],
+        )
+        resultados.extend(indice.trechos[n] for n in da_ronda[: TOP_K - len(resultados)])
+        ronda += 1
     return resultados
 
 
