@@ -128,10 +128,13 @@ O modelo é sem estado entre pedidos; o programa envia-lhe o histórico recente 
 - Guarda no máximo as últimas 8 mensagens (perguntas e respostas), sem repetir os trechos recuperados.
 - No modo terminal, o histórico dura até terminares o programa ou usares `/limpar`.
 - No browser, cada separador mantém uma conversa independente em `sessionStorage`; atualizar a página mantém os últimos turnos. O botão **Limpar conversa** apaga o histórico desse separador; fechar o separador termina essa conversa.
+- O controlo **Usar histórico** no chat web e o comando `/historico` no terminal ativam ou desativam o envio de mensagens anteriores ao modelo. Desativar não apaga o registo visível; ao reativar, o histórico da conversa volta a ser usado. A preferência do controlo web fica guardada por separador.
 - Se o browser bloquear o armazenamento da sessão, as respostas continuam a ser mostradas; só a persistência do histórico fica indisponível. Os erros de rede/timeout são apresentados na conversa e na consola do browser.
 - Perguntas de seguimento usam as duas perguntas anteriores na pesquisa, e pedidos explícitos para repetir/resumir a resposta anterior são respondidos a partir do histórico sem acrescentar excertos de documentos.
 - A pesquisa ignora palavras comuns, exige correspondência de palavras de conteúdo quando existe, e só recorre a resultados puramente semânticos com `SIMILARIDADE_EMBEDDINGS_MINIMA`. Isto reduz o risco de apresentar documentos sem relação como fontes; baixa esse limiar se consultas por sinónimos deixarem de encontrar material.
 - A pesquisa limita a três trechos por ficheiro para evitar que um único PDF ocupe todo o contexto. A resposta da API inclui os caminhos dos ficheiros cujos excertos foram fornecidos ao modelo; o browser mostra-os separadamente da resposta.
+- Quando há resultados em pelo menos duas fontes, o chat e o terminal mostram uma estimativa heurística de dispersão da pesquisa. Calcula-se a distribuição da pontuação máxima por fonte e o número equivalente de fontes com peso semelhante; é um sinal de possível ambiguidade, não uma medida calibrada de confiança factual nem uma confirmação de sentidos diferentes.
+- A estratégia de resposta combina essa dispersão com os resultados da pesquisa: dispersão baixa prioriza a fonte mais relevante; dispersão moderada/alta pede ao modelo uma síntese comparativa com atribuição das fontes; sem excertos que passem os filtros de relevância, o modelo pode responder com conhecimento geral, identificando que não encontrou apoio no corpus. Entropia alta não faz, por si só, os documentos serem descartados.
 
 `NUM_CTX=16384` define a janela de contexto enviada ao Ollama. É importante que seja suficientemente grande para o histórico e os trechos recuperados; se for demasiado baixa, o Ollama pode truncar o prompt e o modelo perder parte da conversa. Uma janela maior aumenta o uso de memória.
 
@@ -146,6 +149,7 @@ Os parâmetros encontram-se no início do ficheiro `rag`:
 | `CHUNK_SIZE` | 1800 | Tamanho alvo dos trechos, em caracteres |
 | `CHUNK_OVERLAP` | 240 | Sobreposição entre trechos |
 | `TOP_K` | 8 | Máximo de trechos recuperados para contexto |
+| `MODO_RESPOSTA` | `automatico` | `automatico`, `priorizar_documentos` ou `priorizar_llm` |
 | `MAX_TRECHOS_POR_FONTE` | 3 | Máximo de trechos selecionados por ficheiro |
 | `SIMILARIDADE_MINIMA` | 0.25 | Pontuação híbrida mínima para incluir um trecho |
 | `SIMILARIDADE_EMBEDDINGS_MINIMA` | 0.68 | Semelhança mínima quando não há correspondência lexical |

@@ -29,7 +29,8 @@ CHUNK_SIZE = 1800
 CHUNK_OVERLAP = 240
 TOP_K = 16
 MAX_TRECHOS_POR_FONTE = 40
-SIMILARIDADE_MINIMA = 0.55
+MODO_RESPOSTA = "priorizar_llm"  # automatico | priorizar_documentos | priorizar_llm
+SIMILARIDADE_MINIMA = 0.35
 PESO_EMBEDDINGS = 0.75
 PESO_JACCARD = 0.25
 # Multiplicadores por tipo de ficheiro: >1 favorece, <1 penaliza.
@@ -53,10 +54,10 @@ MAX_MENSAGENS_HISTORICO = 1
 # Ollama descarrega-os ao fim de 5 minutos e recarregá-los demora segundos).
 KEEP_ALIVE = "30m"
 # Palavras presentes em mais desta fração dos trechos são ignoradas no Jaccard.
-FREQUENCIA_MAXIMA_PALAVRA = 0.005
+FREQUENCIA_MAXIMA_PALAVRA = 0.05
 # Quando não há correspondência lexical, exige-se uma semelhança semântica
 # mais forte para evitar apresentar documentos aleatórios como fontes.
-SIMILARIDADE_EMBEDDINGS_MINIMA = 0.58
+SIMILARIDADE_EMBEDDINGS_MINIMA = 0.48
 # Janela de contexto pedida ao Ollama. O valor por defeito (2048-4096
 # tokens) é menor que o prompt (TOP_K x CHUNK_SIZE + histórico) e o Ollama
 # corta silenciosamente o excesso, perdendo o histórico.
@@ -104,6 +105,7 @@ def executar_com_limite(funcao, *args, **kwargs):
 class Trecho:
     texto: str
     fonte: str
+    pontuacao: float = 0.0
 
 
 def palavras(texto: str) -> set[str]:
@@ -507,9 +509,69 @@ def recuperar(pergunta: str, indice: Indice) -> list[Trecho]:
             (v[ronda] for v in por_fonte.values() if len(v) > ronda),
             key=lambda n: -pontuacao[n],
         )
-        resultados.extend(indice.trechos[n] for n in da_ronda[: TOP_K - len(resultados)])
+        resultados.extend(
+            Trecho(
+                indice.trechos[n].texto,
+                indice.trechos[n].fonte,
+                float(pontuacao[n]),
+            )
+            for n in da_ronda[: TOP_K - len(resultados)]
+        )
         ronda += 1
     return resultados
+
+
+def estimar_ambiguidade(contexto: list[Trecho]) -> dict[str, str | float | int] | None:
+    """Estima dispersão entre fontes; não mede confiança factual nem sentidos."""
+    melhores_por_fonte: dict[str, float] = {}
+    for trecho in contexto:
+        melhores_por_fonte[trecho.fonte] = max(
+            melhores_por_fonte.get(trecho.fonte, float("-inf")),
+            trecho.pontuacao,
+        )
+    pontuacoes = np.asarray(list(melhores_por_fonte.values()), dtype=np.float64)
+    if pontuacoes.size < 2:
+        return None
+
+    pesos = np.exp((pontuacoes - pontuacoes.max()) / 0.05)
+    pesos /= pesos.sum()
+    entropia = -float(np.sum(pesos * np.log(pesos)))
+    fontes_efetivas = math.exp(entropia)
+    if fontes_efetivas <= 1.5:
+        nivel = "baixo"
+    elif fontes_efetivas <= 3:
+        nivel = "moderado"
+    else:
+        nivel = "alto"
+    return {
+        "nivel": nivel,
+        "fontes": int(pontuacoes.size),
+        "fontes_efetivas": round(fontes_efetivas, 1),
+    }
+
+
+def decidir_estrategia_resposta(
+    contexto: list[Trecho],
+    dispersao: dict[str, str | float | int] | None,
+    usar_historico: bool,
+) -> str:
+    modos_validos = {"automatico", "priorizar_documentos", "priorizar_llm"}
+    if MODO_RESPOSTA not in modos_validos:
+        raise ValueError(
+            f"MODO_RESPOSTA inválido: {MODO_RESPOSTA!r}. "
+            f"Valores válidos: {', '.join(sorted(modos_validos))}."
+        )
+    if usar_historico:
+        return "historico"
+    if not contexto:
+        return "llm-geral"
+    if MODO_RESPOSTA == "priorizar_documentos":
+        return "documentos"
+    if MODO_RESPOSTA == "priorizar_llm":
+        return "llm-principal"
+    if dispersao and dispersao["nivel"] in {"moderado", "alto"}:
+        return "sintese-multifonte"
+    return "fonte-principal"
 
 
 INSTRUCAO_SISTEMA = (
@@ -593,9 +655,11 @@ def responder(
     pergunta: str,
     indice: Indice,
     historico: list[dict[str, str]] | None = None,
-) -> tuple[str, str | None, list[str]]:
-    """Devolve (resposta, raciocínio). O raciocínio pode ser None se o
-    modelo não o suportar ou se `MOSTRAR_RACIOCINIO` estiver desligado.
+) -> tuple[str, str | None, list[str], dict[str, str | float | int] | None]:
+    """Devolve resposta, raciocínio, fontes e estimativa de dispersão.
+
+    O raciocínio pode ser None se não estiver disponível. A dispersão é
+    None se houver menos de duas fontes distintas.
 
     `historico` são as mensagens anteriores da conversa (user/assistant)."""
     global _raciocinio_suportado
@@ -608,6 +672,10 @@ def responder(
         usar_historico = bool(anteriores) and refere_se_a_resposta_anterior(pergunta)
         consulta = " ".join([*anteriores[-2:], pergunta])
         contexto = [] if usar_historico else recuperar(consulta, indice)
+        ambiguidade = estimar_ambiguidade(contexto)
+        estrategia = decidir_estrategia_resposta(
+            contexto, ambiguidade, usar_historico
+        )
         if contexto:
             fontes_por_nome = list(dict.fromkeys(t.fonte for t in contexto))
             numeros_fontes = {nome: i + 1 for i, nome in enumerate(fontes_por_nome)}
@@ -624,8 +692,35 @@ def responder(
                 "citação [Fonte N] correspondente. Não inventes citações nem "
                 "atribuições. Se os excertos não responderem, diz claramente "
                 "que não encontraste essa informação. Se as fontes "
-                "discordarem, explica a diferença."
+                "discordarem, explica a diferença. Se abordarem sentidos "
+                "diferentes de um termo, identifica-os em vez de os misturar."
             )
+            if estrategia == "fonte-principal":
+                instrucao += (
+                    " A pontuação está concentrada numa fonte principal: "
+                    "prioriza essa fonte e usa as restantes apenas para "
+                    "corroborar ou acrescentar informação claramente relevante."
+                )
+            elif estrategia == "sintese-multifonte":
+                instrucao += (
+                    " A relevância está distribuída por várias fontes: "
+                    "sintetiza os excertos relevantes, atribui cada afirmação "
+                    "à respetiva fonte e separa perspetivas distintas. "
+                    "Dispersão não significa, por si só, contradição."
+                )
+            elif estrategia == "documentos":
+                instrucao += (
+                    " MODO priorizar_documentos: baseia a resposta apenas nos "
+                    "excertos recuperados; não acrescentes conhecimento geral "
+                    "do modelo como se viesse do corpus."
+                )
+            elif estrategia == "llm-principal":
+                instrucao += (
+                    " MODO priorizar_llm: responde primeiro com o conhecimento "
+                    "geral do modelo. Usa os excertos como apoio secundário, "
+                    "separa claramente o que vem deles do que é conhecimento "
+                    "geral e cita apenas afirmações efetivamente apoiadas nas fontes."
+                )
             pergunta_modelo = (
                 f"EXCERTOS RECUPERADOS:\n{fontes}\n\n"
                 f"PERGUNTA ATUAL: {pergunta}"
@@ -636,10 +731,18 @@ def responder(
                 "consultes nem inventes fontes documentais."
                 if usar_historico
                 else
-                "A pesquisa não encontrou excertos relevantes nos documentos. "
-                "Não afirmes que consultaste fontes. Responde com base no "
-                "histórico se a pergunta se referir à conversa; caso contrário, "
-                "diz que não encontraste informação nos documentos."
+                (
+                    "A pesquisa não encontrou excertos relevantes nos documentos. "
+                    "Não inventes informação documental. Diz que não encontraste "
+                    "apoio no corpus."
+                    if MODO_RESPOSTA == "priorizar_documentos"
+                    else
+                    "A pesquisa não encontrou excertos relevantes nos documentos. "
+                    "Responde à pergunta com conhecimento geral do modelo, se "
+                    "souberes, e começa por indicar brevemente que a resposta não "
+                    "foi encontrada no corpus. Não afirmes que consultaste fontes "
+                    "nem apresentes conhecimento geral como se viesse dos documentos."
+                )
             )
             pergunta_modelo = pergunta
 
@@ -676,9 +779,14 @@ def responder(
             _raciocinio_suportado = True
         raciocinio = response["message"].get("thinking") if pedir_raciocinio else None
         conteudo = limpar_raciocinio_do_texto(response["message"]["content"])
-        return conteudo, raciocinio, list(dict.fromkeys(t.fonte for t in contexto))
+        return (
+            conteudo,
+            raciocinio,
+            list(dict.fromkeys(t.fonte for t in contexto)),
+            ambiguidade,
+        )
     except TempoEsgotadoError as erro:
-        return f"Tempo esgotado: {erro} Tenta novamente.", None, []
+        return f"Tempo esgotado: {erro} Tenta novamente.", None, [], None
 
 
 
@@ -756,8 +864,11 @@ window.MathJax = {
   .tu { color: #0a5; }
   .agente { color: #333; }
   .fontes { color: #555; font-size: 0.9rem; margin: -0.4rem 0 0.8rem; }
-  form { display: flex; gap: 0.5rem; }
+  .ambiguidade { color: #555; font-size: 0.85rem; margin: -0.4rem 0 0.8rem; }
+  form { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
   input { flex: 1; padding: 0.5rem; }
+  input[type="checkbox"] { flex: 0 0 auto; }
+  .controlo-historico { display: inline-flex; align-items: center; gap: 0.35rem; }
   button { padding: 0.5rem 1rem; }
 </style>
 </head>
@@ -766,6 +877,10 @@ window.MathJax = {
   <div id="historico"></div>
   <form id="form">
     <input id="pergunta" autocomplete="off" placeholder="Escreve a tua pergunta..." />
+    <label class="controlo-historico" title="Quando desligado, as mensagens anteriores não são enviadas ao modelo.">
+      <input id="usar-historico" type="checkbox"  />
+      Usar histórico
+    </label>
     <button type="submit">Enviar</button>
     <button id="limpar" type="button">Limpar conversa</button>
   </form>
@@ -775,8 +890,24 @@ const form = document.getElementById('form');
 const campo = document.getElementById('pergunta');
 const botaoEnviar = form.querySelector('button[type="submit"]');
 const botaoLimpar = document.getElementById('limpar');
+const controloHistorico = document.getElementById('usar-historico');
 let conversa = [];
 const chaveConversa = 'agente-rag-conversa';
+const chaveUsarHistorico = 'agente-rag-usar-historico';
+
+try {
+  controloHistorico.checked = sessionStorage.getItem(chaveUsarHistorico) !== 'false';
+} catch (erro) {
+  console.error('Não foi possível restaurar a preferência do histórico:', erro);
+}
+
+controloHistorico.addEventListener('change', () => {
+  try {
+    sessionStorage.setItem(chaveUsarHistorico, String(controloHistorico.checked));
+  } catch (erro) {
+    console.error('Não foi possível guardar a preferência do histórico:', erro);
+  }
+});
 
 function adicionar(classe, texto) {
   const div = document.createElement('div');
@@ -850,7 +981,11 @@ form.addEventListener('submit', async (evento) => {
       resposta = await fetch('/api/chat', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({pergunta, historico: conversa}),
+      body: JSON.stringify({
+        pergunta,
+        historico: conversa,
+        usar_historico: controloHistorico.checked,
+      }),
         signal: controlador.signal,
       });
     } finally {
@@ -871,6 +1006,16 @@ form.addEventListener('submit', async (evento) => {
         lista.className = 'msg fontes';
         lista.textContent = 'Excerto(s) fornecido(s): ' + fontes.join(', ');
         ultimo.after(lista);
+      }
+      const estimativa = dados.ambiguidade;
+      if (estimativa && estimativa.nivel) {
+        const nota = document.createElement('div');
+        nota.className = 'msg ambiguidade';
+        nota.textContent = 'Dispersão da pesquisa: ' + estimativa.nivel +
+          ' (' + estimativa.fontes + ' fontes; equivalente a cerca de ' +
+          estimativa.fontes_efetivas + ' fontes com peso semelhante). ' +
+          'É uma heurística, não uma medida de confiança factual.';
+        (fontes.length ? ultimo.nextSibling : ultimo).after(nota);
       }
     }
     renderizarMatematica(ultimo);
@@ -960,10 +1105,14 @@ class ChatHandler(BaseHTTPRequestHandler):
             return
 
         historico = normalizar_historico(dados.get("historico"))
-        resposta, _raciocinio, fontes = responder(
-            pergunta, ChatHandler.indice, historico
+        usar_historico = dados.get("usar_historico", True) is not False
+        resposta, _raciocinio, fontes, ambiguidade = responder(
+            pergunta, ChatHandler.indice, historico if usar_historico else []
         )
-        self._responder_json(200, {"resposta": resposta, "fontes": fontes})
+        self._responder_json(
+            200,
+            {"resposta": resposta, "fontes": fontes, "ambiguidade": ambiguidade},
+        )
 
 
 def iniciar_servidor_https(indice: Indice, host: str = SERVIDOR_HOST, porta: int = SERVIDOR_PORTA) -> None:
@@ -1013,8 +1162,9 @@ def main() -> None:
         iniciar_servidor_https(indice, host=args.host, porta=args.porta)
         return
 
-    print("Comandos: /sair, /reindexar, /limpar, /raciocinio")
+    print("Comandos: /sair, /reindexar, /limpar, /historico, /raciocinio")
     historico: list[dict[str, str]] = []
+    usar_historico = True
     while True:
         pergunta = input("Tu: ").strip()
         comando = pergunta.lower()
@@ -1031,6 +1181,11 @@ def main() -> None:
             historico = []
             print("Conversa reiniciada.")
             continue
+        if comando == "/historico":
+            usar_historico = not usar_historico
+            estado = "ativado" if usar_historico else "desativado"
+            print(f"Uso do histórico {estado}.")
+            continue
         if comando == "/raciocinio":
             MOSTRAR_RACIOCINIO = not MOSTRAR_RACIOCINIO
             estado = "ativado" if MOSTRAR_RACIOCINIO else "desativado"
@@ -1039,7 +1194,9 @@ def main() -> None:
         if not pergunta:
             continue
 
-        resposta, raciocinio, fontes = responder(pergunta, indice, historico)
+        resposta, raciocinio, fontes, ambiguidade = responder(
+            pergunta, indice, historico if usar_historico else []
+        )
         historico += [
             {"role": "user", "content": pergunta},
             {"role": "assistant", "content": resposta},
@@ -1053,6 +1210,13 @@ def main() -> None:
         print("Agente:", resposta)
         if fontes:
             print("Fontes:", ", ".join(fontes))
+        if ambiguidade:
+            print(
+                "Dispersão da pesquisa:",
+                ambiguidade["nivel"],
+                f"({ambiguidade['fontes']} fontes; equivalente a "
+                f"cerca de {ambiguidade['fontes_efetivas']} fontes com peso semelhante).",
+            )
 
 
 if __name__ == "__main__":
